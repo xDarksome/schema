@@ -1,23 +1,34 @@
 package schema
 
 import (
+	"encoding"
 	"errors"
 	"fmt"
 	"reflect"
 	"strconv"
 )
 
-type encoderFunc func(reflect.Value) string
+type encoderFunc func(reflect.Value) (string, error)
 
 // Encoder encodes values from a struct into url.Values.
 type Encoder struct {
-	cache  *cache
-	regenc map[reflect.Type]encoderFunc
+	cache          *cache
+	regenc         map[reflect.Type]encoderFunc
+	useTextMarshal bool
 }
 
 // NewEncoder returns a new Encoder with defaults.
 func NewEncoder() *Encoder {
 	return &Encoder{cache: newCache(), regenc: make(map[reflect.Type]encoderFunc)}
+}
+
+// UseTextMarshal controls the behaviour when the decoder encounters values
+// that implements encoding.TextMarshaler.
+// If u is true and such value encountered, MarshalText will be used.
+//
+// To preserve backwards compatibility, the default value is false.
+func (e *Encoder) UseTextMarshal(u bool) {
+	e.useTextMarshal = u
 }
 
 // Encode encodes a struct into map[string][]string.
@@ -31,7 +42,9 @@ func (e *Encoder) Encode(src interface{}, dst map[string][]string) error {
 
 // RegisterEncoder registers a converter for encoding a custom type.
 func (e *Encoder) RegisterEncoder(value interface{}, encoder func(reflect.Value) string) {
-	e.regenc[reflect.TypeOf(value)] = encoder
+	e.regenc[reflect.TypeOf(value)] = func(v reflect.Value) (string, error) {
+		return encoder(v), nil
+	}
 }
 
 // SetAliasTag changes the tag used to locate custom field aliases.
@@ -91,11 +104,14 @@ func (e *Encoder) encode(v reflect.Value, dst map[string][]string) error {
 			continue
 		}
 
-		encFunc := typeEncoder(v.Field(i).Type(), e.regenc)
+		encFunc := e.typeEncoder(v.Field(i).Type(), e.regenc)
 
 		// Encode non-slice types and custom implementations immediately.
 		if encFunc != nil {
-			value := encFunc(v.Field(i))
+			value, err := encFunc(v.Field(i))
+			if err != nil {
+				errors[v.Field(i).Type().String()] = fmt.Errorf("schema: failed to encode field: %s", err)
+			}
 			if opts.Contains("omitempty") && isZero(v.Field(i)) {
 				continue
 			}
@@ -110,7 +126,7 @@ func (e *Encoder) encode(v reflect.Value, dst map[string][]string) error {
 		}
 
 		if v.Field(i).Type().Kind() == reflect.Slice {
-			encFunc = typeEncoder(v.Field(i).Type().Elem(), e.regenc)
+			encFunc = e.typeEncoder(v.Field(i).Type().Elem(), e.regenc)
 		}
 
 		if encFunc == nil {
@@ -125,7 +141,12 @@ func (e *Encoder) encode(v reflect.Value, dst map[string][]string) error {
 
 		dst[name] = []string{}
 		for j := 0; j < v.Field(i).Len(); j++ {
-			dst[name] = append(dst[name], encFunc(v.Field(i).Index(j)))
+			value, err := encFunc(v.Field(i).Index(j))
+			if err != nil {
+				errors[v.Field(i).Type().String()] = fmt.Errorf("schema: failed to encode slice element: %s", err)
+				continue
+			}
+			dst[name] = append(dst[name], value)
 		}
 	}
 
@@ -135,9 +156,13 @@ func (e *Encoder) encode(v reflect.Value, dst map[string][]string) error {
 	return nil
 }
 
-func typeEncoder(t reflect.Type, reg map[reflect.Type]encoderFunc) encoderFunc {
+func (e *Encoder) typeEncoder(t reflect.Type, reg map[reflect.Type]encoderFunc) encoderFunc {
 	if f, ok := reg[t]; ok {
 		return f
+	}
+
+	if e.useTextMarshal && t.Implements(reflect.TypeOf((*encoding.TextMarshaler)(nil)).Elem()) {
+		return encodeTextMarshaler
 	}
 
 	switch t.Kind() {
@@ -152,10 +177,10 @@ func typeEncoder(t reflect.Type, reg map[reflect.Type]encoderFunc) encoderFunc {
 	case reflect.Float64:
 		return encodeFloat64
 	case reflect.Ptr:
-		f := typeEncoder(t.Elem(), reg)
-		return func(v reflect.Value) string {
+		f := e.typeEncoder(t.Elem(), reg)
+		return func(v reflect.Value) (string, error) {
 			if v.IsNil() {
-				return "null"
+				return "null", nil
 			}
 			return f(v.Elem())
 		}
@@ -166,30 +191,39 @@ func typeEncoder(t reflect.Type, reg map[reflect.Type]encoderFunc) encoderFunc {
 	}
 }
 
-func encodeBool(v reflect.Value) string {
-	return strconv.FormatBool(v.Bool())
+func encodeTextMarshaler(v reflect.Value) (string, error) {
+	text, err := v.Interface().(encoding.TextMarshaler).MarshalText()
+	if err != nil {
+		return "", err
+	}
+
+	return string(text), nil
 }
 
-func encodeInt(v reflect.Value) string {
-	return strconv.FormatInt(int64(v.Int()), 10)
+func encodeBool(v reflect.Value) (string, error) {
+	return strconv.FormatBool(v.Bool()), nil
 }
 
-func encodeUint(v reflect.Value) string {
-	return strconv.FormatUint(uint64(v.Uint()), 10)
+func encodeInt(v reflect.Value) (string, error) {
+	return strconv.FormatInt(int64(v.Int()), 10), nil
 }
 
-func encodeFloat(v reflect.Value, bits int) string {
-	return strconv.FormatFloat(v.Float(), 'f', 6, bits)
+func encodeUint(v reflect.Value) (string, error) {
+	return strconv.FormatUint(uint64(v.Uint()), 10), nil
 }
 
-func encodeFloat32(v reflect.Value) string {
+func encodeFloat(v reflect.Value, bits int) (string, error) {
+	return strconv.FormatFloat(v.Float(), 'f', 6, bits), nil
+}
+
+func encodeFloat32(v reflect.Value) (string, error) {
 	return encodeFloat(v, 32)
 }
 
-func encodeFloat64(v reflect.Value) string {
+func encodeFloat64(v reflect.Value) (string, error) {
 	return encodeFloat(v, 64)
 }
 
-func encodeString(v reflect.Value) string {
-	return v.String()
+func encodeString(v reflect.Value) (string, error) {
+	return v.String(), nil
 }

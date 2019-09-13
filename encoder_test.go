@@ -417,3 +417,41 @@ func TestRegisterEncoderCustomArrayType(t *testing.T) {
 		encoder.Encode(s, vals)
 	}
 }
+
+type E7 struct {
+	F01 rudeBool
+	F02 *rudeBool
+	F03 []rudeBool
+	F04 []*rudeBool
+}
+
+func (id rudeBool) MarshalText() ([]byte, error) {
+	if id {
+		return []byte("Yup"), nil
+	} else {
+		return []byte("Nope"), nil
+	}
+}
+
+func TestEncoderMarshalText(t *testing.T) {
+	rf := rudeBool(false)
+	rt := rudeBool(true)
+
+	s := E7{
+		F01: rf,
+		F02: &rt,
+		F03: []rudeBool{rf, rt},
+		F04: []*rudeBool{&rt, &rf},
+	}
+
+	encoder := NewEncoder()
+	encoder.UseTextMarshal(true)
+
+	vals := map[string][]string{}
+	encoder.Encode(&s, vals)
+
+	valExists(t, "F01", "Nope", vals)
+	valExists(t, "F02", "Yup", vals)
+	valsExist(t, "F03", []string{"Nope", "Yup"}, vals)
+	valsExist(t, "F04", []string{"Yup", "Nope"}, vals)
+}
